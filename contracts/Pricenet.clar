@@ -11,6 +11,8 @@
 (define-constant ERR_ALERT_ALREADY_EXISTS (err u410))
 (define-constant ERR_INVALID_ALERT_TYPE (err u411))
 (define-constant ERR_ALERT_LIMIT_REACHED (err u412))
+(define-constant ERR_INVALID_TIER (err u413))
+(define-constant ERR_INVALID_MULTIPLIER (err u414))
 
 (define-data-var total-price-entries uint u0)
 (define-data-var min-stake-amount uint u100)
@@ -18,6 +20,10 @@
 (define-data-var contract-paused bool false)
 (define-data-var total-alerts uint u0)
 (define-data-var max-alerts-per-user uint u20)
+(define-data-var tier-update-frequency uint u1000)
+(define-data-var base-multiplier uint u100)
+(define-data-var high-activity-threshold uint u10)
+(define-data-var medium-activity-threshold uint u5)
 
 (define-map price-data
     {item: (string-ascii 64), location: (string-ascii 64)}
@@ -96,6 +102,27 @@
     (list 50 uint)
 )
 
+(define-map pricing-tier-data
+    {item: (string-ascii 64), location: (string-ascii 64)}
+    {
+        activity-count: uint,
+        current-tier: uint,
+        stake-multiplier: uint,
+        last-updated: uint,
+        total-reports: uint
+    }
+)
+
+(define-map tier-multipliers
+    uint
+    uint
+)
+
+(define-map tier-thresholds
+    uint
+    uint
+)
+
 (define-public (submit-price (item (string-ascii 64)) (location (string-ascii 64)) (price uint))
     (let (
         (current-block stacks-block-height)
@@ -105,7 +132,7 @@
         (last-submission (default-to u0 (map-get? reporter-cooldowns cooldown-key)))
     )
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
-    (asserts! (>= stake-amount (var-get min-stake-amount)) ERR_INSUFFICIENT_STAKE)
+    (asserts! (>= stake-amount (get-required-stake item location)) ERR_INSUFFICIENT_STAKE)
     (asserts! (> price u0) ERR_INVALID_PRICE)
     (asserts! (> (len item) u0) ERR_INVALID_ITEM)
     (asserts! (> (len location) u0) ERR_INVALID_LOCATION)
@@ -136,6 +163,7 @@
     (update-location-items location item)
     (update-reporter-stats reporter)
     (trigger-price-alerts item location price)
+    (update-pricing-tier item location)
     (ok entry-id)
     ))
 )
@@ -326,6 +354,51 @@
     )
 )
 
+(define-public (initialize-pricing-tiers)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set tier-multipliers u1 u100)
+        (map-set tier-multipliers u2 u150)
+        (map-set tier-multipliers u3 u200)
+        (map-set tier-multipliers u4 u300)
+        (map-set tier-thresholds u1 u0)
+        (map-set tier-thresholds u2 u5)
+        (map-set tier-thresholds u3 u10)
+        (map-set tier-thresholds u4 u20)
+        (ok true)
+    )
+)
+
+(define-public (set-tier-multiplier (tier uint) (multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= tier u1) (<= tier u4)) ERR_INVALID_TIER)
+        (asserts! (>= multiplier u50) ERR_INVALID_MULTIPLIER)
+        (map-set tier-multipliers tier multiplier)
+        (ok multiplier)
+    )
+)
+
+(define-public (set-tier-threshold (tier uint) (threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= tier u1) (<= tier u4)) ERR_INVALID_TIER)
+        (map-set tier-thresholds tier threshold)
+        (ok threshold)
+    )
+)
+
+(define-public (update-tier-parameters (update-freq uint) (base-mult uint) (high-thresh uint) (med-thresh uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set tier-update-frequency update-freq)
+        (var-set base-multiplier base-mult)
+        (var-set high-activity-threshold high-thresh)
+        (var-set medium-activity-threshold med-thresh)
+        (ok true)
+    )
+)
+
 (define-read-only (get-price (item (string-ascii 64)) (location (string-ascii 64)))
     (map-get? price-data {item: item, location: location})
 )
@@ -369,8 +442,50 @@
         cooldown-blocks: (var-get price-cooldown),
         paused: (var-get contract-paused),
         total-alerts: (var-get total-alerts),
-        max-alerts-per-user: (var-get max-alerts-per-user)
+        max-alerts-per-user: (var-get max-alerts-per-user),
+        tier-update-frequency: (var-get tier-update-frequency),
+        base-multiplier: (var-get base-multiplier),
+        high-activity-threshold: (var-get high-activity-threshold),
+        medium-activity-threshold: (var-get medium-activity-threshold)
     }
+)
+
+(define-read-only (get-pricing-tier-info (item (string-ascii 64)) (location (string-ascii 64)))
+    (default-to 
+        {activity-count: u0, current-tier: u1, stake-multiplier: u100, last-updated: u0, total-reports: u0}
+        (map-get? pricing-tier-data {item: item, location: location})
+    )
+)
+
+(define-read-only (get-required-stake (item (string-ascii 64)) (location (string-ascii 64)))
+    (let (
+        (tier-info (get-pricing-tier-info item location))
+        (base-stake (var-get min-stake-amount))
+        (multiplier (get stake-multiplier tier-info))
+    )
+    (/ (* base-stake multiplier) u100)
+    )
+)
+
+(define-read-only (get-tier-multiplier (tier uint))
+    (default-to u100 (map-get? tier-multipliers tier))
+)
+
+(define-read-only (get-tier-threshold (tier uint))
+    (default-to u0 (map-get? tier-thresholds tier))
+)
+
+(define-read-only (calculate-tier-for-activity (activity-count uint))
+    (if (>= activity-count (get-tier-threshold u4))
+        u4
+        (if (>= activity-count (get-tier-threshold u3))
+            u3
+            (if (>= activity-count (get-tier-threshold u2))
+                u2
+                u1
+            )
+        )
+    )
 )
 
 (define-read-only (get-price-alert (alert-id uint))
@@ -555,3 +670,63 @@
     )
     )
 )
+
+(define-private (update-pricing-tier (item (string-ascii 64)) (location (string-ascii 64)))
+    (let (
+        (current-block stacks-block-height)
+        (tier-key {item: item, location: location})
+        (current-data (default-to 
+            {activity-count: u0, current-tier: u1, stake-multiplier: u100, last-updated: u0, total-reports: u0}
+            (map-get? pricing-tier-data tier-key)
+        ))
+        (new-activity-count (+ (get activity-count current-data) u1))
+        (new-total-reports (+ (get total-reports current-data) u1))
+        (should-update (>= (- current-block (get last-updated current-data)) (var-get tier-update-frequency)))
+    )
+    (if should-update
+        (let (
+            (new-tier (calculate-tier-for-activity new-activity-count))
+            (new-multiplier (get-tier-multiplier new-tier))
+        )
+        (map-set pricing-tier-data tier-key {
+            activity-count: new-activity-count,
+            current-tier: new-tier,
+            stake-multiplier: new-multiplier,
+            last-updated: current-block,
+            total-reports: new-total-reports
+        })
+        )
+        (map-set pricing-tier-data tier-key {
+            activity-count: new-activity-count,
+            current-tier: (get current-tier current-data),
+            stake-multiplier: (get stake-multiplier current-data),
+            last-updated: (get last-updated current-data),
+            total-reports: new-total-reports
+        })
+    )
+    )
+)
+
+(define-private (recalculate-tier-for-item (item (string-ascii 64)) (location (string-ascii 64)))
+    (let (
+        (tier-key {item: item, location: location})
+        (current-data (default-to 
+            {activity-count: u0, current-tier: u1, stake-multiplier: u100, last-updated: u0, total-reports: u0}
+            (map-get? pricing-tier-data tier-key)
+        ))
+        (activity-count (get activity-count current-data))
+        (new-tier (calculate-tier-for-activity activity-count))
+        (new-multiplier (get-tier-multiplier new-tier))
+    )
+    (map-set pricing-tier-data tier-key {
+        activity-count: activity-count,
+        current-tier: new-tier,
+        stake-multiplier: new-multiplier,
+        last-updated: stacks-block-height,
+        total-reports: (get total-reports current-data)
+    })
+    )
+)
+
+
+
