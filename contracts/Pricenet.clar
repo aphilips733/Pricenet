@@ -13,6 +13,8 @@
 (define-constant ERR_ALERT_LIMIT_REACHED (err u412))
 (define-constant ERR_INVALID_TIER (err u413))
 (define-constant ERR_INVALID_MULTIPLIER (err u414))
+(define-constant ERR_INSUFFICIENT_DATA (err u415))
+(define-constant ERR_VOLATILITY_NOT_FOUND (err u416))
 
 (define-data-var total-price-entries uint u0)
 (define-data-var min-stake-amount uint u100)
@@ -24,6 +26,8 @@
 (define-data-var base-multiplier uint u100)
 (define-data-var high-activity-threshold uint u10)
 (define-data-var medium-activity-threshold uint u5)
+(define-data-var volatility-window-size uint u10)
+(define-data-var volatility-update-threshold uint u100)
 
 (define-map price-data
     {item: (string-ascii 64), location: (string-ascii 64)}
@@ -123,6 +127,20 @@
     uint
 )
 
+;; Price Volatility Analytics System
+(define-map price-volatility
+    {item: (string-ascii 64), location: (string-ascii 64)}
+    {
+        current-volatility: uint,
+        average-price: uint,
+        min-price: uint,
+        max-price: uint,
+        price-count: uint,
+        stability-score: uint,
+        trend-indicator: int ;; -1=declining, 0=stable, 1=rising
+    }
+)
+
 (define-public (submit-price (item (string-ascii 64)) (location (string-ascii 64)) (price uint))
     (let (
         (current-block stacks-block-height)
@@ -164,6 +182,7 @@
     (update-reporter-stats reporter)
     (trigger-price-alerts item location price)
     (update-pricing-tier item location)
+    (update-price-volatility item location price)
     (ok entry-id)
     ))
 )
@@ -214,6 +233,7 @@
             (begin
                 (map-set price-data price-key (merge price-info {verified: true}))
                 (update-reporter-verified (get reporter price-info))
+                (finalize-volatility-calculation item location (get price price-info))
                 (ok true)
             )
             (ok false)
@@ -446,7 +466,9 @@
         tier-update-frequency: (var-get tier-update-frequency),
         base-multiplier: (var-get base-multiplier),
         high-activity-threshold: (var-get high-activity-threshold),
-        medium-activity-threshold: (var-get medium-activity-threshold)
+        medium-activity-threshold: (var-get medium-activity-threshold),
+        volatility-window-size: (var-get volatility-window-size),
+        volatility-update-threshold: (var-get volatility-update-threshold)
     }
 )
 
@@ -707,6 +729,53 @@
     )
 )
 
+;; Volatility Analytics Read-Only Functions
+(define-read-only (get-volatility-metrics (item (string-ascii 64)) (location (string-ascii 64)))
+    (map-get? price-volatility {item: item, location: location})
+)
+
+(define-read-only (get-market-stability-score (item (string-ascii 64)) (location (string-ascii 64)))
+    (let ((vol (get current-volatility (get-volatility-data item location))))
+    (if (> vol u0) (/ u10000 vol) u10000))
+)
+
+(define-read-only (get-trend-analysis (item (string-ascii 64)) (location (string-ascii 64)))
+    (let (
+        (data (get-volatility-data item location))
+        (trend (get trend-indicator data))
+        (stability (get stability-score data))
+    )
+    {
+        trend-direction: (if (> trend 0) "rising" (if (< trend 0) "declining" "stable")),
+        stability-rating: (if (> stability u8000) "high" (if (> stability u5000) "medium" "low")),
+        price-range: (- (get max-price data) (get min-price data)),
+        average-price: (get average-price data)
+    })
+)
+
+;; Price Volatility Analytics Public Functions
+(define-public (get-volatility-insights (item (string-ascii 64)) (location (string-ascii 64)))
+    (let (
+        (data (get-volatility-data item location))
+        (trend-info (get-trend-analysis item location))
+    )
+    (asserts! (> (get price-count data) u0) ERR_INSUFFICIENT_DATA)
+    (ok {
+        volatility: (get current-volatility data),
+        stability-score: (get stability-score data),
+        trend: (get trend-direction trend-info),
+        stability-rating: (get stability-rating trend-info),
+        price-data: {
+            current: (get-current-verified-price item location),
+            average: (get average-price data),
+            min: (get min-price data),
+            max: (get max-price data)
+        },
+        data-points: (get price-count data)
+    })
+    )
+)
+
 (define-private (recalculate-tier-for-item (item (string-ascii 64)) (location (string-ascii 64)))
     (let (
         (tier-key {item: item, location: location})
@@ -728,5 +797,50 @@
     )
 )
 
+;; Private Helper Functions for Volatility Analytics
+(define-private (get-volatility-data (item (string-ascii 64)) (location (string-ascii 64)))
+    (default-to 
+        {current-volatility: u0, average-price: u0, min-price: u0, max-price: u0, price-count: u0, stability-score: u0, trend-indicator: 0}
+        (map-get? price-volatility {item: item, location: location})
+    )
+)
+
+(define-private (get-current-verified-price (item (string-ascii 64)) (location (string-ascii 64)))
+    (match (get-verified-price item location)
+        price-info (get price price-info)
+        u0
+    )
+)
+
+(define-private (update-price-volatility (item (string-ascii 64)) (location (string-ascii 64)) (new-price uint))
+    (let ((data (get-volatility-data item location)) (count (get price-count (get-volatility-data item location))))
+    (if (is-eq count u0)
+        (map-set price-volatility {item: item, location: location} {
+            current-volatility: u0, average-price: new-price, min-price: new-price,
+            max-price: new-price, price-count: u1, stability-score: u10000, trend-indicator: 0
+        })
+        (let (
+            (new-count (+ count u1))
+            (old-avg (get average-price data))
+            (new-avg (/ (+ (* old-avg count) new-price) new-count))
+            (new-min (if (< new-price (get min-price data)) new-price (get min-price data)))
+            (new-max (if (> new-price (get max-price data)) new-price (get max-price data)))
+            (vol-score (if (> new-avg u0) (/ (* (- new-max new-min) u100) new-avg) u0))
+            (stability (/ u10000 (+ vol-score u1)))
+            (trend (if (> (if (> new-price old-avg) (- new-price old-avg) (- old-avg new-price)) (/ old-avg u20))
+                      (if (> new-price old-avg) 1 -1) 0))
+        )
+        (map-set price-volatility {item: item, location: location} {
+            current-volatility: vol-score, average-price: new-avg, min-price: new-min,
+            max-price: new-max, price-count: new-count, stability-score: stability, trend-indicator: trend
+        })
+        ))
+    )
+)
+
+(define-private (finalize-volatility-calculation (item (string-ascii 64)) (location (string-ascii 64)) (verified-price uint))
+    (if (>= (get price-count (get-volatility-data item location)) (var-get volatility-update-threshold))
+        (update-price-volatility item location verified-price) true)
+)
 
 
