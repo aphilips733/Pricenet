@@ -1,0 +1,23 @@
+[project]
+name = 'Pricenet'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Pricenet]
+path = 'contracts/Pricenet.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.price-predictor]
+path = 'contracts/price-predictor.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
